@@ -338,3 +338,11 @@ if st.session_state.get("results"):
 
 else:
     st.info("Voer eerst stap 1 en 2 uit om resultaten te zien.")
+
+
+if __name__ == "__main__":
+    import sys
+    from streamlit.web.cli import main
+
+    sys.argv = ["streamlit", "run", __file__, "--server.headless", "true"]
+    main()
