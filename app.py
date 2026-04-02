@@ -8,7 +8,7 @@ from category_manager import (
     parse_categories_from_text,
     get_category_options,
 )
-from file_handler import detect_columns, prepare_products_for_categorization, read_product_file
+from file_handler import prepare_products_for_categorization, read_product_file
 from categorizer import categorize_products
 from exporter import create_akeneo_export
 from config import AVAILABLE_MODELS, DEFAULT_BATCH_SIZE, DEFAULT_MODEL
@@ -37,13 +37,33 @@ def cached_parse_categories_text(text: str):
     return parse_categories_from_text(text)
 
 
+@st.cache_data(show_spinner=False)
+def cached_detect_columns(df_columns: tuple) -> dict:
+    """Cache column detection based on column names (tuple for hashability)."""
+    from config import IDENTIFIER_PATTERNS, NAME_PATTERNS, DESCRIPTION_PATTERNS, BRAND_PATTERNS
+    columns_lower = {col.lower(): col for col in df_columns}
+
+    def find_col(patterns):
+        for p in patterns:
+            if p in columns_lower:
+                return columns_lower[p]
+        for p in patterns:
+            for cl, co in columns_lower.items():
+                if p in cl:
+                    return co
+        return None
+
+    return {
+        "identifier": find_col(IDENTIFIER_PATTERNS),
+        "name": find_col(NAME_PATTERNS),
+        "description": find_col(DESCRIPTION_PATTERNS),
+        "brand": find_col(BRAND_PATTERNS),
+    }
+
+
 # ── Initialise session state defaults ──
 if "step" not in st.session_state:
     st.session_state["step"] = 1  # 1=upload, 2=categorise, 3=review
-
-
-def _step_done(n: int) -> bool:
-    return st.session_state["step"] > n
 
 
 st.title("Akeneo Auto-Categorisatie Tool")
@@ -122,8 +142,8 @@ with st.sidebar:
     if categories:
         st.success(f"{len(categories)} categorieën geladen")
         with st.expander("Categorieën bekijken"):
-            for cat in categories:
-                st.text(f"{cat.code}: {cat.full_path}")
+            cat_lines = "\n".join(f"{cat.code}: {cat.full_path}" for cat in categories)
+            st.code(cat_lines, language=None)
 
 # ──────────────────────────────────────────────
 # MAIN AREA
@@ -163,8 +183,8 @@ if product_file:
 
         st.success(f"{len(df)} producten geladen uit {product_file.name}")
 
-        # Auto-detect columns
-        detected = detect_columns(df)
+        # Auto-detect columns (cached)
+        detected = cached_detect_columns(tuple(df.columns))
 
         st.subheader("Kolom Mapping")
         st.caption("Controleer of de juiste kolommen zijn gedetecteerd en pas aan indien nodig.")
@@ -267,140 +287,134 @@ if st.session_state["step"] >= 2:
                 medium = sum(1 for r in results if r.get("confidence") == "medium")
                 low = sum(1 for r in results if r.get("confidence") == "low")
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Totaal", len(results))
-                c2.metric("Hoog vertrouwen", high)
-                c3.metric("Gemiddeld", medium)
-                c4.metric("Laag vertrouwen", low)
-
                 st.rerun()
 
             except Exception as e:
                 st.error(f"Fout tijdens categorisatie: {e}")
 
 
-# ══════════════════════════════════════════════
-# STAP 3 — Review & Export  (fragment = partial rerun)
-# ══════════════════════════════════════════════
-if st.session_state["step"] >= 3 and st.session_state.get("results"):
+@st.fragment
+def review_and_export():
+    """Stap 3 as a fragment — interactions here only rerun this section."""
+    st.divider()
+    st.header("3. Review & Export")
 
-    @st.fragment
-    def review_and_export():
-        st.divider()
-        st.header("3. Review & Export")
+    results = st.session_state["results"]
+    categories = st.session_state.get("categories", [])
+    category_codes = [""] + [cat.code for cat in categories]
+    code_to_path = {cat.code: cat.full_path for cat in categories}
 
-        results = st.session_state["results"]
-        categories = st.session_state.get("categories", [])
-        category_codes = [""] + [cat.code for cat in categories]
-        code_to_path = {cat.code: cat.full_path for cat in categories}
+    # Stats
+    high = sum(1 for r in results if r.get("confidence") == "high")
+    medium = sum(1 for r in results if r.get("confidence") == "medium")
+    low = sum(1 for r in results if r.get("confidence") == "low")
 
-        # Stats
-        high = sum(1 for r in results if r.get("confidence") == "high")
-        medium = sum(1 for r in results if r.get("confidence") == "medium")
-        low = sum(1 for r in results if r.get("confidence") == "low")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Totaal", len(results))
+    c2.metric("Hoog vertrouwen", high)
+    c3.metric("Gemiddeld", medium)
+    c4.metric("Laag vertrouwen", low)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Totaal", len(results))
-        c2.metric("Hoog vertrouwen", high)
-        c3.metric("Gemiddeld", medium)
-        c4.metric("Laag vertrouwen", low)
+    # Build review DataFrame
+    review_data = []
+    for r in results:
+        review_data.append(
+            {
+                "identifier": r.get("identifier", ""),
+                "category_code": r.get("category_code", ""),
+                "categorie": code_to_path.get(r.get("category_code", ""), r.get("category_code", "")),
+                "confidence": r.get("confidence", ""),
+                "redenering": r.get("reasoning", ""),
+            }
+        )
 
-        # Build review DataFrame
-        review_data = []
-        for r in results:
-            review_data.append(
+    review_df = pd.DataFrame(review_data)
+
+    # Confidence filter
+    filter_confidence = st.multiselect(
+        "Filter op confidence",
+        ["high", "medium", "low"],
+        default=["high", "medium", "low"],
+    )
+    filtered_df = review_df[review_df["confidence"].isin(filter_confidence)]
+
+    st.caption(f"{len(filtered_df)} van {len(review_df)} producten getoond")
+
+    # Editable table
+    edited_df = st.data_editor(
+        filtered_df,
+        column_config={
+            "identifier": st.column_config.TextColumn("Identifier", disabled=True),
+            "category_code": st.column_config.SelectboxColumn(
+                "Category Code",
+                options=category_codes,
+                help="Selecteer de juiste categorie code",
+            ),
+            "categorie": st.column_config.TextColumn("Categorie Pad", disabled=True),
+            "confidence": st.column_config.TextColumn("Confidence", disabled=True),
+            "redenering": st.column_config.TextColumn("Redenering", disabled=True, width="large"),
+        },
+        use_container_width=True,
+        num_rows="fixed",
+        key="review_table",
+    )
+
+    # Merge edits back
+    if edited_df is not None:
+        edited_results = []
+        for _, row in edited_df.iterrows():
+            edited_results.append(
                 {
-                    "identifier": r.get("identifier", ""),
-                    "category_code": r.get("category_code", ""),
-                    "categorie": code_to_path.get(r.get("category_code", ""), r.get("category_code", "")),
-                    "confidence": r.get("confidence", ""),
-                    "redenering": r.get("reasoning", ""),
+                    "identifier": row["identifier"],
+                    "category_code": row["category_code"],
+                    "confidence": row["confidence"],
+                    "reasoning": row["redenering"],
                 }
             )
+        result_map = {r["identifier"]: r for r in results}
+        for er in edited_results:
+            result_map[er["identifier"]] = er
+        final_results = list(result_map.values())
+    else:
+        final_results = results
 
-        review_df = pd.DataFrame(review_data)
+    # Export
+    st.divider()
+    col1, col2 = st.columns(2)
 
-        # Confidence filter
-        filter_confidence = st.multiselect(
-            "Filter op confidence",
-            ["high", "medium", "low"],
-            default=["high", "medium", "low"],
-        )
-        filtered_df = review_df[review_df["confidence"].isin(filter_confidence)]
-
-        st.caption(f"{len(filtered_df)} van {len(review_df)} producten getoond")
-
-        # Editable table
-        edited_df = st.data_editor(
-            filtered_df,
-            column_config={
-                "identifier": st.column_config.TextColumn("Identifier", disabled=True),
-                "category_code": st.column_config.SelectboxColumn(
-                    "Category Code",
-                    options=category_codes,
-                    help="Selecteer de juiste categorie code",
-                ),
-                "categorie": st.column_config.TextColumn("Categorie Pad", disabled=True),
-                "confidence": st.column_config.TextColumn("Confidence", disabled=True),
-                "redenering": st.column_config.TextColumn("Redenering", disabled=True, width="large"),
-            },
-            use_container_width=True,
-            num_rows="fixed",
-            key="review_table",
+    with col1:
+        include_context = st.checkbox(
+            "Context kolommen toevoegen",
+            value=True,
+            help="Voeg productnaam, confidence en redenering toe als referentie",
         )
 
-        # Merge edits back
-        if edited_df is not None:
-            edited_results = []
-            for _, row in edited_df.iterrows():
-                edited_results.append(
-                    {
-                        "identifier": row["identifier"],
-                        "category_code": row["category_code"],
-                        "confidence": row["confidence"],
-                        "reasoning": row["redenering"],
-                    }
-                )
-            result_map = {r["identifier"]: r for r in results}
-            for er in edited_results:
-                result_map[er["identifier"]] = er
-            final_results = list(result_map.values())
-        else:
-            final_results = results
+    if st.button("Genereer Akeneo Export", type="primary"):
+        source_df = st.session_state["source_df"]
+        column_mapping = st.session_state["column_mapping"]
 
-        # Export
-        st.divider()
-        col1, col2 = st.columns(2)
+        excel_bytes = create_akeneo_export(
+            results=final_results,
+            source_df=source_df,
+            identifier_column=column_mapping["identifier"],
+            include_context=include_context,
+            name_column=column_mapping.get("name"),
+        )
 
-        with col1:
-            include_context = st.checkbox(
-                "Context kolommen toevoegen",
-                value=True,
-                help="Voeg productnaam, confidence en redenering toe als referentie",
-            )
+        st.download_button(
+            label="Download Excel",
+            data=excel_bytes,
+            file_name="akeneo_categorisatie_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
 
-        if st.button("Genereer Akeneo Export", type="primary"):
-            source_df = st.session_state["source_df"]
-            column_mapping = st.session_state["column_mapping"]
 
-            excel_bytes = create_akeneo_export(
-                results=final_results,
-                source_df=source_df,
-                identifier_column=column_mapping["identifier"],
-                include_context=include_context,
-                name_column=column_mapping.get("name"),
-            )
-
-            st.download_button(
-                label="Download Excel",
-                data=excel_bytes,
-                file_name="akeneo_categorisatie_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-
+# ══════════════════════════════════════════════
+# STAP 3 — Review & Export
+# ══════════════════════════════════════════════
+if st.session_state["step"] >= 3 and st.session_state.get("results"):
     review_and_export()
-
 elif st.session_state["step"] < 3:
     st.divider()
     st.header("3. Review & Export")
