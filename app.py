@@ -8,7 +8,7 @@ from category_manager import (
     parse_categories_from_text,
     get_category_options,
 )
-from file_handler import detect_columns, prepare_products_for_categorization, read_product_file
+from file_handler import prepare_products_for_categorization, read_product_file
 from categorizer import categorize_products
 from exporter import create_akeneo_export
 from config import AVAILABLE_MODELS, DEFAULT_BATCH_SIZE, DEFAULT_MODEL
@@ -20,23 +20,67 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ── Cached helpers to avoid re-parsing on every rerun ──
+@st.cache_data(show_spinner=False)
+def cached_read_products(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    return read_product_file(file_bytes, filename)
+
+
+@st.cache_data(show_spinner=False)
+def cached_parse_categories_csv(file_bytes: bytes, filename: str):
+    return parse_categories_from_csv(file_bytes, filename)
+
+
+@st.cache_data(show_spinner=False)
+def cached_parse_categories_text(text: str):
+    return parse_categories_from_text(text)
+
+
+@st.cache_data(show_spinner=False)
+def cached_detect_columns(df_columns: tuple) -> dict:
+    """Cache column detection based on column names (tuple for hashability)."""
+    from config import IDENTIFIER_PATTERNS, NAME_PATTERNS, DESCRIPTION_PATTERNS, BRAND_PATTERNS
+    columns_lower = {col.lower(): col for col in df_columns}
+
+    def find_col(patterns):
+        for p in patterns:
+            if p in columns_lower:
+                return columns_lower[p]
+        for p in patterns:
+            for cl, co in columns_lower.items():
+                if p in cl:
+                    return co
+        return None
+
+    return {
+        "identifier": find_col(IDENTIFIER_PATTERNS),
+        "name": find_col(NAME_PATTERNS),
+        "description": find_col(DESCRIPTION_PATTERNS),
+        "brand": find_col(BRAND_PATTERNS),
+    }
+
+
+# ── Initialise session state defaults ──
+if "step" not in st.session_state:
+    st.session_state["step"] = 1  # 1=upload, 2=categorise, 3=review
+
+
 st.title("Akeneo Auto-Categorisatie Tool")
 st.caption("Categoriseer producten automatisch met behulp van Claude AI")
 
 # ──────────────────────────────────────────────
-# SIDEBAR - Settings
+# SIDEBAR - Settings (always visible)
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.header("Instellingen")
 
-    # API Key
     api_key = st.text_input(
         "Anthropic API Key",
         type="password",
         help="Je kunt een API key aanmaken op console.anthropic.com",
     )
 
-    # Model selection
     model_label = st.selectbox(
         "AI Model",
         options=list(AVAILABLE_MODELS.keys()),
@@ -45,7 +89,6 @@ with st.sidebar:
     )
     selected_model = AVAILABLE_MODELS[model_label]
 
-    # Batch size
     batch_size = st.slider(
         "Batch grootte",
         min_value=5,
@@ -64,7 +107,7 @@ with st.sidebar:
         horizontal=True,
     )
 
-    categories = None
+    categories = st.session_state.get("categories")
 
     if category_input_method == "Bestand uploaden":
         cat_file = st.file_uploader(
@@ -74,11 +117,13 @@ with st.sidebar:
         )
         if cat_file:
             try:
+                file_bytes = cat_file.getvalue()
                 if cat_file.name.endswith(".txt"):
-                    text = cat_file.getvalue().decode("utf-8")
-                    categories = parse_categories_from_text(text)
+                    text = file_bytes.decode("utf-8")
+                    categories = cached_parse_categories_text(text)
                 else:
-                    categories = parse_categories_from_csv(cat_file.getvalue(), cat_file.name)
+                    categories = cached_parse_categories_csv(file_bytes, cat_file.name)
+                st.session_state["categories"] = categories
             except Exception as e:
                 st.error(f"Fout bij het lezen van categoriebestand: {e}")
     else:
@@ -89,25 +134,38 @@ with st.sidebar:
         )
         if cat_text.strip():
             try:
-                categories = parse_categories_from_text(cat_text)
+                categories = cached_parse_categories_text(cat_text)
+                st.session_state["categories"] = categories
             except Exception as e:
                 st.error(f"Fout bij het parsen van categorieën: {e}")
 
     if categories:
         st.success(f"{len(categories)} categorieën geladen")
         with st.expander("Categorieën bekijken"):
-            for cat in categories:
-                st.text(f"{cat.code}: {cat.full_path}")
-
-    # Store in session state
-    if categories:
-        st.session_state["categories"] = categories
+            cat_lines = "\n".join(f"{cat.code}: {cat.full_path}" for cat in categories)
+            st.code(cat_lines, language=None)
 
 # ──────────────────────────────────────────────
 # MAIN AREA
 # ──────────────────────────────────────────────
 
-# ── STAP 1: Upload producten ──
+# ── Status overzicht ──
+step = st.session_state["step"]
+cols = st.columns(3)
+labels = ["Upload Producten", "Categoriseren", "Review & Export"]
+for i, (col, label) in enumerate(zip(cols, labels), 1):
+    if i < step:
+        col.success(f"**Stap {i}: {label}**")
+    elif i == step:
+        col.info(f"**Stap {i}: {label}**")
+    else:
+        col.markdown(f"**Stap {i}: {label}**")
+
+st.divider()
+
+# ══════════════════════════════════════════════
+# STAP 1 — Upload producten
+# ══════════════════════════════════════════════
 st.header("1. Upload Producten")
 
 product_file = st.file_uploader(
@@ -118,14 +176,15 @@ product_file = st.file_uploader(
 
 if product_file:
     try:
-        df = read_product_file(product_file.getvalue(), product_file.name)
+        file_bytes = product_file.getvalue()
+        df = cached_read_products(file_bytes, product_file.name)
         st.session_state["source_df"] = df
         st.session_state["filename"] = product_file.name
 
         st.success(f"{len(df)} producten geladen uit {product_file.name}")
 
-        # Auto-detect columns
-        detected = detect_columns(df)
+        # Auto-detect columns (cached)
+        detected = cached_detect_columns(tuple(df.columns))
 
         st.subheader("Kolom Mapping")
         st.caption("Controleer of de juiste kolommen zijn gedetecteerd en pas aan indien nodig.")
@@ -147,7 +206,6 @@ if product_file:
             brand_idx = all_columns.index(detected["brand"]) if detected["brand"] in all_columns else 0
             selected_brand = st.selectbox("Merk kolom", all_columns, index=brand_idx)
 
-        # Store column mapping
         column_mapping = {
             "identifier": selected_id if selected_id != "(niet geselecteerd)" else None,
             "name": selected_name if selected_name != "(niet geselecteerd)" else None,
@@ -156,90 +214,106 @@ if product_file:
         }
         st.session_state["column_mapping"] = column_mapping
 
-        # Preview
-        with st.expander("Data preview (eerste 10 rijen)", expanded=True):
+        with st.expander("Data preview (eerste 10 rijen)"):
             st.dataframe(df.head(10), use_container_width=True)
+
+        # Advance step if ready
+        if column_mapping.get("identifier") and st.session_state["step"] < 2:
+            st.session_state["step"] = 2
 
     except Exception as e:
         st.error(f"Fout bij het lezen van bestand: {e}")
 
-# ── STAP 2: Categoriseren ──
-st.header("2. Categoriseren")
 
-can_categorize = (
-    api_key
-    and st.session_state.get("categories")
-    and st.session_state.get("source_df") is not None
-    and st.session_state.get("column_mapping", {}).get("identifier")
-)
+# ══════════════════════════════════════════════
+# STAP 2 — Categoriseren
+# ══════════════════════════════════════════════
+if st.session_state["step"] >= 2:
+    st.divider()
+    st.header("2. Categoriseren")
 
-if not can_categorize:
-    missing = []
-    if not api_key:
-        missing.append("API key")
-    if not st.session_state.get("categories"):
-        missing.append("Categorieën")
-    if st.session_state.get("source_df") is None:
-        missing.append("Product bestand")
-    elif not st.session_state.get("column_mapping", {}).get("identifier"):
-        missing.append("Identifier kolom")
-    st.info(f"Nog nodig: {', '.join(missing)}")
+    can_categorize = bool(
+        api_key
+        and st.session_state.get("categories")
+        and st.session_state.get("source_df") is not None
+        and st.session_state.get("column_mapping", {}).get("identifier")
+    )
 
-if st.button("Start Categorisatie", disabled=not can_categorize, type="primary"):
-    categories = st.session_state["categories"]
-    df = st.session_state["source_df"]
-    column_mapping = st.session_state["column_mapping"]
+    if not can_categorize:
+        missing = []
+        if not api_key:
+            missing.append("API key (sidebar)")
+        if not st.session_state.get("categories"):
+            missing.append("Categorieën (sidebar)")
+        if st.session_state.get("source_df") is None:
+            missing.append("Product bestand")
+        elif not st.session_state.get("column_mapping", {}).get("identifier"):
+            missing.append("Identifier kolom")
+        st.info(f"Nog nodig: {', '.join(missing)}")
 
-    products = prepare_products_for_categorization(df, column_mapping)
+    if st.button("Start Categorisatie", disabled=not can_categorize, type="primary"):
+        categories = st.session_state["categories"]
+        df = st.session_state["source_df"]
+        column_mapping = st.session_state["column_mapping"]
 
-    if not products:
-        st.error("Geen producten gevonden met een geldige identifier.")
-    else:
-        st.info(f"Categoriseren van {len(products)} producten in batches van {batch_size}...")
-        total_batches = (len(products) + batch_size - 1) // batch_size
+        products = prepare_products_for_categorization(df, column_mapping)
 
-        progress_bar = st.progress(0, text="Bezig met categoriseren...")
-        status_text = st.empty()
+        if not products:
+            st.error("Geen producten gevonden met een geldige identifier.")
+        else:
+            st.info(f"Categoriseren van {len(products)} producten in batches van {batch_size}...")
 
-        def update_progress(current, total):
-            progress_bar.progress(current / total, text=f"Batch {current}/{total} verwerkt")
+            progress_bar = st.progress(0, text="Bezig met categoriseren...")
 
-        try:
-            results = categorize_products(
-                products=products,
-                categories=categories,
-                api_key=api_key,
-                model=selected_model,
-                batch_size=batch_size,
-                progress_callback=update_progress,
-            )
+            def update_progress(current, total):
+                progress_bar.progress(current / total, text=f"Batch {current}/{total} verwerkt")
 
-            st.session_state["results"] = results
-            progress_bar.progress(1.0, text="Categorisatie voltooid!")
+            try:
+                results = categorize_products(
+                    products=products,
+                    categories=categories,
+                    api_key=api_key,
+                    model=selected_model,
+                    batch_size=batch_size,
+                    progress_callback=update_progress,
+                )
 
-            # Stats
-            high = sum(1 for r in results if r.get("confidence") == "high")
-            medium = sum(1 for r in results if r.get("confidence") == "medium")
-            low = sum(1 for r in results if r.get("confidence") == "low")
+                st.session_state["results"] = results
+                st.session_state["step"] = 3
+                progress_bar.progress(1.0, text="Categorisatie voltooid!")
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Totaal", len(results))
-            col2.metric("Hoog vertrouwen", high)
-            col3.metric("Gemiddeld", medium)
-            col4.metric("Laag vertrouwen", low)
+                # Stats
+                high = sum(1 for r in results if r.get("confidence") == "high")
+                medium = sum(1 for r in results if r.get("confidence") == "medium")
+                low = sum(1 for r in results if r.get("confidence") == "low")
 
-        except Exception as e:
-            st.error(f"Fout tijdens categorisatie: {e}")
+                st.rerun()
 
-# ── STAP 3: Review & Export ──
-st.header("3. Review & Export")
+            except Exception as e:
+                st.error(f"Fout tijdens categorisatie: {e}")
 
-if st.session_state.get("results"):
+
+@st.fragment
+def review_and_export():
+    """Stap 3 as a fragment — interactions here only rerun this section."""
+    st.divider()
+    st.header("3. Review & Export")
+
     results = st.session_state["results"]
     categories = st.session_state.get("categories", [])
-    category_options = get_category_options(categories)
     category_codes = [""] + [cat.code for cat in categories]
     code_to_path = {cat.code: cat.full_path for cat in categories}
+
+    # Stats
+    high = sum(1 for r in results if r.get("confidence") == "high")
+    medium = sum(1 for r in results if r.get("confidence") == "medium")
+    low = sum(1 for r in results if r.get("confidence") == "low")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Totaal", len(results))
+    c2.metric("Hoog vertrouwen", high)
+    c3.metric("Gemiddeld", medium)
+    c4.metric("Laag vertrouwen", low)
 
     # Build review DataFrame
     review_data = []
@@ -285,7 +359,7 @@ if st.session_state.get("results"):
         key="review_table",
     )
 
-    # Update results with any edits
+    # Merge edits back
     if edited_df is not None:
         edited_results = []
         for _, row in edited_df.iterrows():
@@ -297,7 +371,6 @@ if st.session_state.get("results"):
                     "reasoning": row["redenering"],
                 }
             )
-        # Merge edited results back (for filtered items only)
         result_map = {r["identifier"]: r for r in results}
         for er in edited_results:
             result_map[er["identifier"]] = er
@@ -310,11 +383,11 @@ if st.session_state.get("results"):
     col1, col2 = st.columns(2)
 
     with col1:
-        include_context = st.checkbox("Context kolommen toevoegen", value=True,
-                                       help="Voeg productnaam, confidence en redenering toe als referentie")
-
-    with col2:
-        pass
+        include_context = st.checkbox(
+            "Context kolommen toevoegen",
+            value=True,
+            help="Voeg productnaam, confidence en redenering toe als referentie",
+        )
 
     if st.button("Genereer Akeneo Export", type="primary"):
         source_df = st.session_state["source_df"]
@@ -336,7 +409,15 @@ if st.session_state.get("results"):
             type="primary",
         )
 
-else:
+
+# ══════════════════════════════════════════════
+# STAP 3 — Review & Export
+# ══════════════════════════════════════════════
+if st.session_state["step"] >= 3 and st.session_state.get("results"):
+    review_and_export()
+elif st.session_state["step"] < 3:
+    st.divider()
+    st.header("3. Review & Export")
     st.info("Voer eerst stap 1 en 2 uit om resultaten te zien.")
 
 
